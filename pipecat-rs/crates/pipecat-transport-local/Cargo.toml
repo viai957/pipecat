@@ -1,0 +1,21 @@
+[package]
+name = "pipecat-transport-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local audio transport (cpal) for Pipecat pipelines"
+
+[dependencies]
+pipecat-core = { path = "../pipecat-core" }
+pipecat-pipeline = { path = "../pipecat-pipeline" }
+pipecat-transport-traits = { path = "../pipecat-transport-traits" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

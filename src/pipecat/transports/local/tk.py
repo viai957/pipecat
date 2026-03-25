@@ -12,7 +12,6 @@ PyAudio for audio I/O, suitable for desktop applications and testing.
 
 import asyncio
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -27,6 +26,7 @@ from pipecat.frames.frames import (
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.utils.thread_pool import SharedThreadPool
 
 try:
     import pyaudio
@@ -150,7 +150,7 @@ class TkOutputTransport(BaseOutputTransport):
 
         # We only write audio frames from a single task, so only one thread
         # should be necessary.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = SharedThreadPool.get_executor()
 
         # Start with a neutral gray background.
         array = np.ones((1024, 1024, 3)) * 128

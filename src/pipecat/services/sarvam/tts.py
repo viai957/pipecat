@@ -756,7 +756,9 @@ class SarvamTTSService(InterruptibleTTSService):
         )
         min_buffer_size: Optional[int] = Field(
             default=50,
-            description="Minimum characters to buffer before TTS processing.",
+            ge=30,
+            le=200,
+            description="Minimum characters to buffer before TTS processing. Sarvam API range: 30-200.",
         )
         max_chunk_length: Optional[int] = Field(
             default=150,

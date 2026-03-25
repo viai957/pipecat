@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pipecat-core",
+    "crates/pipecat-audio",
+    "crates/pipecat-metrics",
+    "crates/pipecat-pipeline",
+    "crates/pipecat-transport-traits",
+    "crates/pipecat-transport-local",
+    "crates/pipecat-vad",
+    "crates/pipecat-service-traits",
+    "crates/pipecat-service-deepgram",
+    "crates/pipecat-bench",
+    "crates/pipecat-python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+repository = "https://github.com/pipecat-ai/pipecat"
+
+[workspace.dependencies]
+# Shared dependencies across crates
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# Audio
+rubato = "0.16"
+dasp = "0.11"
+cpal = "0.15"
+rtrb = "0.3"
+
+# ML inference
+ort = "2"
+
+# Networking
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+hdrhistogram = "7"
+
+# Testing
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true

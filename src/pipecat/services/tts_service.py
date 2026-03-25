@@ -130,6 +130,9 @@ class TTSService(AIService):
         sample_rate: Optional[int] = None,
         # if True, enables word-level timestamp tracking and synchronization
         supports_word_timestamps: bool = False,
+        # Time in milliseconds to wait before force-flushing buffered text that
+        # hasn't reached a sentence boundary.  0 disables the timeout.
+        text_flush_timeout_ms: float = 400,
         # Text aggregator to aggregate incoming tokens and decide when to push to the TTS.
         text_aggregator: Optional[BaseTextAggregator] = None,
         # Types of text aggregations that should not be spoken.
@@ -162,6 +165,10 @@ class TTSService(AIService):
             pause_frame_processing: Whether to pause frame processing during audio generation.
             append_trailing_space: Whether to append a trailing space to text before sending to TTS.
                 This helps prevent some TTS services from vocalizing trailing punctuation (e.g., "dot").
+            text_flush_timeout_ms: Maximum time in milliseconds to buffer aggregated text
+                before force-flushing, even without a sentence boundary.  Prevents long
+                gaps when the LLM emits text without clear sentence-ending punctuation
+                (e.g. "OK", single words, text ending with commas).  Set to 0 to disable.
             sample_rate: Output sample rate for generated audio.
             supports_word_timestamps: Whether this service supports word-level timestamp tracking.
                 When True, enables synchronization of audio with spoken words so only spoken words
@@ -195,6 +202,8 @@ class TTSService(AIService):
             **kwargs,
         )
         self._aggregate_sentences: bool = aggregate_sentences
+        self._text_flush_timeout_s: float = text_flush_timeout_ms / 1000.0
+        self._flush_timeout_task: Optional[asyncio.Task] = None
         self._push_text_frames: bool = push_text_frames
         self._push_stop_frames: bool = push_stop_frames
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
@@ -393,6 +402,7 @@ class TTSService(AIService):
             frame: The end frame.
         """
         await super().stop(frame)
+        self._cancel_flush_timeout()
         if self._stop_frame_task:
             await self.cancel_task(self._stop_frame_task)
             self._stop_frame_task = None
@@ -406,6 +416,7 @@ class TTSService(AIService):
             frame: The cancel frame.
         """
         await super().cancel(frame)
+        self._cancel_flush_timeout()
         if self._stop_frame_task:
             await self.cancel_task(self._stop_frame_task)
             self._stop_frame_task = None
@@ -519,6 +530,10 @@ class TTSService(AIService):
             self._llm_response_started = True
             await self.push_frame(frame, direction)
         elif isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
+            # Cancel any pending flush timeout since we are about to flush
+            # everything explicitly.
+            self._cancel_flush_timeout()
+
             # We pause processing incoming frames if the LLM response included
             # text (it might be that it's only a function calling response). We
             # pause to avoid audio overlapping.
@@ -672,6 +687,7 @@ class TTSService(AIService):
             yield TTSAudioRawFrame(audio, self.sample_rate, 1)
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        self._cancel_flush_timeout()
         self._processing_text = False
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
@@ -689,6 +705,37 @@ class TTSService(AIService):
         if self._pause_frame_processing:
             await self.resume_processing_frames()
 
+    def _cancel_flush_timeout(self):
+        """Cancel any pending text flush timeout task."""
+        if self._flush_timeout_task is not None:
+            self._flush_timeout_task.cancel()
+            self._flush_timeout_task = None
+
+    async def _flush_timeout_handler(self):
+        """Wait for the flush timeout, then force-flush buffered text."""
+        try:
+            await asyncio.sleep(self._text_flush_timeout_s)
+            remaining = await self._text_aggregator.flush()
+            if remaining and remaining.text.strip():
+                logger.trace(f"Flush timeout: pushing buffered text: {remaining.text}")
+                await self._push_tts_frames(AggregatedTextFrame(remaining.text, remaining.type))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._flush_timeout_task = None
+
+    def _start_flush_timeout(self):
+        """Start or restart the flush timeout timer.
+
+        Only starts if sentence aggregation is enabled and the timeout is
+        configured (> 0).
+        """
+        self._cancel_flush_timeout()
+        if self._text_flush_timeout_s > 0 and self._aggregate_sentences:
+            self._flush_timeout_task = self.create_task(
+                self._flush_timeout_handler(), f"{self}_flush_timeout"
+            )
+
     async def _process_text_frame(self, frame: TextFrame):
         text: Optional[str] = None
         includes_inter_frame_spaces: bool = False
@@ -703,6 +750,9 @@ class TTSService(AIService):
                     AggregatedTextFrame(text, aggregated_by), includes_inter_frame_spaces
                 )
         else:
+            # Cancel any pending flush timeout since new text just arrived.
+            self._cancel_flush_timeout()
+
             async for aggregate in self._text_aggregator.aggregate(frame.text):
                 text = aggregate.text
                 aggregated_by = aggregate.type
@@ -710,6 +760,13 @@ class TTSService(AIService):
                 await self._push_tts_frames(
                     AggregatedTextFrame(text, aggregated_by), includes_inter_frame_spaces
                 )
+
+            # If the aggregator still has buffered text (no sentence boundary
+            # was found, or text remains after yielding), start a flush timeout
+            # so the text does not sit in the buffer indefinitely.
+            buffered = self._text_aggregator.text
+            if buffered and buffered.text.strip():
+                self._start_flush_timeout()
 
     async def _push_tts_frames(
         self,

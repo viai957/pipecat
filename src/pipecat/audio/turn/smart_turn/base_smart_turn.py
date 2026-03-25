@@ -14,7 +14,6 @@ beyond simple silence-based detection.
 import asyncio
 import time
 from abc import abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -22,6 +21,7 @@ from loguru import logger
 
 from pipecat.audio.turn.base_turn_analyzer import BaseTurnAnalyzer, BaseTurnParams, EndOfTurnState
 from pipecat.metrics.metrics import MetricsData, TurnMetricsData
+from pipecat.utils.thread_pool import SharedThreadPool
 
 # Default timing parameters
 STOP_SECS = 3
@@ -77,7 +77,7 @@ class BaseSmartTurn(BaseTurnAnalyzer):
         self._speech_start_time = 0
         # Thread executor that will run the model. We only need one thread per
         # analyzer because one analyzer just handles one audio stream.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = SharedThreadPool.get_executor()
         self._vad_start_secs: float = 0.0
 
     @property
