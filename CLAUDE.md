@@ -9,8 +9,11 @@ Pipecat is an open-source Python framework for building real-time voice and mult
 ## Common Commands
 
 ```bash
-# Setup development environment
+# Setup development environment (Python only)
 uv sync --group dev --all-extras --no-extra gstreamer --no-extra krisp
+
+# Setup with Rust native engine (optional, requires Rust toolchain)
+make dev-native
 
 # Install pre-commit hooks
 uv run pre-commit install
@@ -34,6 +37,33 @@ uv run ruff format --check
 # Update dependencies (after editing pyproject.toml)
 uv lock && uv sync
 ```
+
+## Rust Native Engine (Optional)
+
+The `pipecat-rs/` directory contains a Rust implementation of the frame routing hot path. When the `pipecat-ai-native` package is installed, Pipecat automatically detects it and can use Rust for frame processing.
+
+```bash
+# Build and install the Rust engine (requires Rust toolchain)
+make dev-native
+
+# Run Rust tests
+make test-native
+
+# Run native integration tests
+make test-native-python
+
+# Disable native engine at runtime
+PIPECAT_NATIVE=0 uv run pytest
+
+# Verify native engine is available
+uv run python -c "from pipecat._native_status import is_native_available; print(is_native_available())"
+```
+
+**For end users (when published to PyPI):** `pip install pipecat-ai[native]` — no Rust toolchain needed, pre-built wheels.
+
+**For developers:** `make dev-native` builds from source and symlinks the `.so` into `src/pipecat/` for editable installs. Requires Rust stable toolchain (`rustup`).
+
+See `pipecat-rs/README.md` for full Rust engine architecture and development docs.
 
 ## Architecture
 

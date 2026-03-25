@@ -12,6 +12,7 @@ for logging, debugging, analytics, and monitoring pipeline behavior.
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 from typing_extensions import TYPE_CHECKING
 
@@ -75,7 +76,36 @@ class BaseObserver(BaseObject):
     needing to inject processors into the pipeline structure. This enables
     non-intrusive monitoring capabilities such as frame logging, debugging,
     performance analysis, and analytics collection.
+
+    Class Attributes:
+        has_process_frame_observers: Whether this observer (or any proxied
+            observer) overrides on_process_frame. Used as a fast-path guard
+            to skip FrameProcessed creation when no observer needs it.
+        has_push_frame_observers: Whether this observer (or any proxied
+            observer) overrides on_push_frame.
     """
+
+    # Default True so unknown/custom observer subclasses always receive events.
+    has_process_frame_observers: bool = True
+    has_push_frame_observers: bool = True
+
+    # Declare the frame types this observer actually handles in on_push_frame.
+    # None means "subscribe to all frame types" (safe default for user observers).
+    # A frozenset[int] restricts dispatching to only those type_id values, enabling
+    # TaskObserver to skip FramePushed creation for unsubscribed frame types.
+    push_frame_types: Optional[frozenset] = None
+
+    def is_push_interested(self, type_id: int) -> bool:
+        """Return True if this observer wants to receive a push event for type_id.
+
+        The default implementation always returns True (conservative — safe for
+        any observer that doesn't declare push_frame_types). TaskObserver
+        overrides this to check against the union of all proxy subscriptions.
+
+        Args:
+            type_id: The integer value of the frame's FrameType enum.
+        """
+        return True
 
     async def on_process_frame(self, data: FrameProcessed):
         """Handle the event when a frame is being processed by a processor.

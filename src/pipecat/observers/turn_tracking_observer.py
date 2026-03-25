@@ -15,6 +15,7 @@ from collections import deque
 
 from loguru import logger
 
+from pipecat.frames.frame_types import FrameType
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -29,6 +30,10 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 class TurnTrackingObserver(BaseObserver):
     """Observer that tracks conversation turns in a pipeline.
 
+    Only handles six specific control/user/bot frame types; all other frames
+    (TextFrame, AudioRawFrame, etc.) are filtered out before FramePushed is
+    even created, saving allocation and queue overhead on every hot-path frame.
+
     This observer monitors the flow of conversation by tracking when turns
     start and end based on user and bot speaking patterns. It handles
     interruptions, timeouts, and maintains turn state throughout the pipeline.
@@ -42,6 +47,15 @@ class TurnTrackingObserver(BaseObserver):
       - The user starts speaking again
       - A timeout period elapses with no more bot speech
     """
+
+    push_frame_types = frozenset({
+        FrameType.CTRL_START,
+        FrameType.CTRL_END,
+        FrameType.CTRL_CANCEL,
+        FrameType.USER_STARTED_SPEAKING,
+        FrameType.BOT_STARTED_SPEAKING,
+        FrameType.BOT_STOPPED_SPEAKING,
+    })
 
     def __init__(self, max_frames=100, turn_end_timeout_secs=2.5, **kwargs):
         """Initialize the turn tracking observer.

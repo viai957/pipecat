@@ -14,7 +14,6 @@ real-time communication features.
 import asyncio
 import time
 from concurrent.futures import CancelledError as FuturesCancelledError
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
 
@@ -48,6 +47,7 @@ from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
+from pipecat.utils.thread_pool import SharedThreadPool
 
 try:
     from daily import (
@@ -495,7 +495,7 @@ class DailyTransportClient(EventHandler):
 
         # We use the executor to cleanup the client. We just do it from one
         # place, so only one thread is really needed.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = SharedThreadPool.get_executor()
 
         self._client: CallClient = CallClient(event_handler=self)
 

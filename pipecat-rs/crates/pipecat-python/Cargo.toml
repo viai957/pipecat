@@ -1,0 +1,21 @@
+[package]
+name = "pipecat-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pipecat__native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pipecat-core = { path = "../pipecat-core" }
+pipecat-pipeline = { path = "../pipecat-pipeline" }
+pipecat-audio = { path = "../pipecat-audio" }
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

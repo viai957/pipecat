@@ -135,6 +135,11 @@ class Frame:
     """
 
     type_id: ClassVar[int] = FrameType.FRAME
+    # Fast membership flags — cheaper than isinstance() (~5 ns vs ~43 ns).
+    # Inherited by all subclasses; overridden to True in SystemFrame and
+    # UninterruptibleFrame respectively.
+    is_system_frame: ClassVar[bool] = False
+    is_uninterruptible: ClassVar[bool] = False
 
     id: int = field(init=False)
     pts: Optional[int] = field(init=False)
@@ -186,6 +191,7 @@ class SystemFrame(Frame):
     """
 
     type_id = FrameType.SYSTEM_FRAME
+    is_system_frame: ClassVar[bool] = True
 
 
 @dataclass
@@ -230,6 +236,7 @@ class UninterruptibleFrame:
     """
 
     __slots__ = ()
+    is_uninterruptible: ClassVar[bool] = True
 
 
 @dataclass

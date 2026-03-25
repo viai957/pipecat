@@ -1,4 +1,5 @@
 prune docs
 prune examples
+prune pipecat-rs
 prune scripts
 prune tests

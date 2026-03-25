@@ -1,0 +1,21 @@
+[package]
+name = "pipecat-transport-traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport traits for Pipecat real-time AI pipelines"
+
+[dependencies]
+pipecat-core = { path = "../pipecat-core" }
+pipecat-pipeline = { path = "../pipecat-pipeline" }
+pipecat-audio = { path = "../pipecat-audio" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+serde_json = { workspace = true }

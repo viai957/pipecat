@@ -11,6 +11,8 @@ next-env.d.ts
 local.properties
 *.log
 *.lock
+# Cargo.lock must be committed for reproducible native wheel builds
+!pipecat-rs/Cargo.lock
 smart_turn_audio_log
 #*#
 
@@ -62,3 +64,15 @@ docs/api/api
 
 # Pipecat
 whisker_setup.py
+
+# Auto-research experiment logs
+tests/benchmarks/experiment_log.tsv
+
+# Compiled extensions
+*.so
+
+# Apple files
+*.pages
+
+# Rust build artifacts
+pipecat-rs/target/

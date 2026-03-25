@@ -20,6 +20,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -35,6 +36,7 @@ from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
 from pipecat import version as pipecat_version
 from pipecat.audio.utils import calculate_audio_volume
+from pipecat.frames.frame_types import FrameCategory, FrameType
 from pipecat.frames.frames import (
     AggregatedTextFrame,
     AggregationType,
@@ -1099,6 +1101,43 @@ class RTVIObserver(BaseObserver):
         are handled by the RTVIProcessor.
     """
 
+    # Explicit subscription set so TaskObserver can skip FramePushed creation
+    # for unsubscribed frame types (TextFrame, AudioRawFrame, etc.) that this
+    # observer never handles. FrameType.FRAME covers deprecated OpenAILLMContextFrame
+    # which has no custom type_id.
+    push_frame_types = frozenset({
+        FrameType.FRAME,             # OpenAILLMContextFrame (no specific type_id)
+        FrameType.SYSTEM_FRAME,      # RTVIServerMessageFrame, RTVIServerResponseFrame
+        FrameType.CTRL_START,
+        FrameType.CTRL_END,
+        FrameType.CTRL_CANCEL,
+        FrameType.TRANSPORT_MSG_IN,  # InputTransportMessageFrame (not in on_push_frame but safe)
+        FrameType.USER_STARTED_SPEAKING,
+        FrameType.USER_STOPPED_SPEAKING,
+        FrameType.USER_MUTE_STARTED,
+        FrameType.USER_MUTE_STOPPED,
+        FrameType.BOT_STARTED_SPEAKING,
+        FrameType.BOT_STOPPED_SPEAKING,
+        FrameType.TEXT_TRANSCRIPTION,
+        FrameType.TEXT_INTERIM_TRANS,
+        FrameType.LLM_CTX_ASST_TS_OPENAI,
+        FrameType.LLM_CONTEXT,
+        FrameType.LLM_RESPONSE_START,
+        FrameType.LLM_RESPONSE_END,
+        FrameType.TEXT_LLM,
+        FrameType.TTS_STARTED,
+        FrameType.TTS_STOPPED,
+        FrameType.TEXT_AGGREGATED,
+        FrameType.TEXT_TTS,
+        FrameType.SYS_METRICS,
+        FrameType.FUNC_CALLS_STARTED,
+        FrameType.FUNC_CALL_PROGRESS,
+        FrameType.FUNC_CALL_CANCEL,
+        FrameType.FUNC_CALL_RESULT,
+        FrameType.AUDIO_RAW_INPUT,   # InputAudioRawFrame (for user audio level)
+        FrameType.AUDIO_TTS,         # TTSAudioRawFrame (for bot audio level)
+    })
+
     def __init__(
         self,
         rtvi: Optional["RTVIProcessor"] = None,
@@ -1579,6 +1618,16 @@ class RTVIObserver(BaseObserver):
         await self.send_rtvi_message(message)
 
 
+# Categories that require special per-frame handling in RTVIProcessor.process_frame.
+# All other categories (AUDIO, TEXT, IMAGE, VIDEO, LLM non-configure, STT, TTS, …)
+# are passthrough — we skip the 8-check isinstance chain entirely.
+_RTVI_SLOW_PATH_CATS = frozenset(
+    {FrameCategory.BASE, FrameCategory.CONTROL, FrameCategory.ERROR, FrameCategory.TRANSPORT}
+)
+# Specific type_id for LLMConfigureOutputFrame (LLM category, needs special handling).
+_LLM_CONFIGURE_OUTPUT_ID = FrameType.LLM_CONFIGURE_OUTPUT
+
+
 class RTVIProcessor(FrameProcessor):
     """Main processor for handling RTVI protocol messages and actions.
 
@@ -1586,6 +1635,13 @@ class RTVIProcessor(FrameProcessor):
     handshaking, configuration management, action execution, and message routing.
     It serves as the central hub for RTVI protocol operations.
     """
+
+    # RTVIProcessor only calls push_frame(frame, direction) for DOWNSTREAM data
+    # frames (audio, text, image, LLM non-configure, etc.) — no side effects.
+    # Marking transparent allows _compute_fast_queue_target() to recurse past
+    # this processor and point directly at the first user processor, eliminating
+    # one asyncio task wakeup per data-frame batch.
+    _transparent_for_data_frames: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1777,7 +1833,21 @@ class RTVIProcessor(FrameProcessor):
             frame: The frame to process.
             direction: The direction of frame flow.
         """
-        await super().process_frame(frame, direction)
+        # Skip super() for data frames with no observer: base class has nothing
+        # to do, saving ~90 ns of coroutine creation per hop. Control frames
+        # (category 0x08) and observer-notified frames always call super().
+        cat = frame.type_id >> 8
+        if (self._observer and self._observer.has_process_frame_observers) or (
+            cat == FrameCategory.CONTROL
+        ):
+            await super().process_frame(frame, direction)
+
+        # Fast path: most data frames (audio, text, image, LLM non-configure, etc.)
+        # have no special handling here — just forward them. This avoids 8 isinstance
+        # checks (~600 ns) for the hot passthrough case.
+        if cat not in _RTVI_SLOW_PATH_CATS and frame.type_id != _LLM_CONFIGURE_OUTPUT_ID:
+            await self.push_frame(frame, direction)
+            return
 
         # Specific system frames
         if isinstance(frame, StartFrame):

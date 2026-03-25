@@ -15,6 +15,7 @@ from typing import Optional, Set, Type
 
 from loguru import logger
 
+from pipecat.frames.frame_types import FrameType
 from pipecat.frames.frames import MetricsFrame
 from pipecat.metrics.metrics import (
     LLMTokenUsage,
@@ -31,6 +32,9 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 class MetricsLogObserver(BaseObserver):
     """Observer to log metrics activity to the console.
+
+    Only subscribes to MetricsFrame (SYS_METRICS) to avoid FramePushed
+    allocation for high-frequency audio/text frames.
 
     Monitors and logs all MetricsFrame instances, including:
 
@@ -57,6 +61,8 @@ class MetricsLogObserver(BaseObserver):
                 )
             ]
     """
+
+    push_frame_types = frozenset({FrameType.SYS_METRICS})
 
     def __init__(
         self,

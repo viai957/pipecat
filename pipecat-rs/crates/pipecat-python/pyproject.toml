@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pipecat-ai-native"
+requires-python = ">=3.10"
+version = "0.1.0"
+description = "Rust native engine for pipecat-ai — high-performance frame routing"
+license = { file = "LICENSE" }
+readme = "README.md"
+authors = [
+    { name = "Daily" },
+]
+keywords = ["pipecat", "voice", "ai", "realtime", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/pipecat-ai/pipecat"
+Repository = "https://github.com/pipecat-ai/pipecat"
+Documentation = "https://docs.pipecat.ai"
+
+[tool.maturin]
+module-name = "pipecat._native"
+python-source = "python"
+manifest-path = "Cargo.toml"
+features = ["pyo3/extension-module"]

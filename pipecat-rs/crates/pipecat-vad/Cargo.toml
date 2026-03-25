@@ -1,0 +1,19 @@
+[package]
+name = "pipecat-vad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voice Activity Detection for Pipecat pipelines"
+
+[dependencies]
+pipecat-core = { path = "../pipecat-core" }
+pipecat-audio = { path = "../pipecat-audio" }
+pipecat-pipeline = { path = "../pipecat-pipeline" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

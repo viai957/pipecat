@@ -20,6 +20,7 @@ from loguru import logger
 
 from pipecat.pipeline.base_task import PipelineTaskParams
 from pipecat.pipeline.task import PipelineTask
+from pipecat.utils import signal_dispatcher
 from pipecat.utils.base_object import BaseObject
 
 
@@ -56,11 +57,12 @@ class PipelineRunner(BaseObject):
         self._force_gc = force_gc
         self._loop = loop or asyncio.get_running_loop()
 
-        if handle_sigint:
-            self._setup_sigint()
-
-        if handle_sigterm:
-            self._setup_sigterm()
+        self._handle_sigint = handle_sigint
+        self._handle_sigterm = handle_sigterm
+        if handle_sigint or handle_sigterm:
+            signal_dispatcher.register_runner(
+                self, handle_sigint=handle_sigint, handle_sigterm=handle_sigterm
+            )
 
     async def run(self, task: PipelineTask):
         """Run a pipeline task to completion.
@@ -83,6 +85,9 @@ class PipelineRunner(BaseObject):
 
         # Cleanup base object.
         await self.cleanup()
+
+        # Deregister from signal dispatcher.
+        signal_dispatcher.deregister_runner(self)
 
         # If we are cancelling through a signal, make sure we wait for it so
         # everything gets cleaned up nicely.
@@ -107,24 +112,6 @@ class PipelineRunner(BaseObject):
     async def _cancel(self):
         """Cancel all running tasks immediately."""
         await asyncio.gather(*[t.cancel() for t in self._tasks.values()])
-
-    def _setup_sigint(self):
-        """Set up signal handlers for graceful shutdown."""
-        try:
-            loop = asyncio.get_running_loop()
-            loop.add_signal_handler(signal.SIGINT, lambda *args: self._sig_handler())
-        except NotImplementedError:
-            # Windows fallback
-            signal.signal(signal.SIGINT, lambda s, f: self._sig_handler())
-
-    def _setup_sigterm(self):
-        """Set up signal handlers for graceful shutdown."""
-        try:
-            loop = asyncio.get_running_loop()
-            loop.add_signal_handler(signal.SIGTERM, lambda *args: self._sig_handler())
-        except NotImplementedError:
-            # Windows fallback
-            signal.signal(signal.SIGTERM, lambda s, f: self._sig_handler())
 
     def _sig_handler(self):
         """Handle interrupt signals by cancelling all tasks."""

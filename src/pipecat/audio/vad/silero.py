@@ -37,6 +37,9 @@ class SileroOnnxModel:
     Provides voice activity detection using the pre-trained Silero VAD model
     with ONNX runtime for efficient inference. Handles model state management
     and input validation for audio processing.
+
+    Hot-path buffers are pre-allocated at initialization to avoid per-call
+    malloc/free overhead (~6KB per inference at 30-50Hz).
     """
 
     def __init__(self, path, force_onnx_cpu=True):
@@ -49,6 +52,8 @@ class SileroOnnxModel:
         opts = onnxruntime.SessionOptions()
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
+        opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 
         if force_onnx_cpu and "CPUExecutionProvider" in onnxruntime.get_available_providers():
             self.session = onnxruntime.InferenceSession(
@@ -59,19 +64,25 @@ class SileroOnnxModel:
 
         self.reset_states()
         self.sample_rates = [8000, 16000]
+        # Cache sample rate arrays to avoid per-call np.array() allocation
+        self._sr_arrays = {sr: np.array(sr, dtype="int64") for sr in self.sample_rates}
+        # Pre-allocate the ORT input dict — values are updated in-place each call
+        self._ort_inputs = {"input": None, "state": None, "sr": None}
+        # Flag to skip validation after first successful call
+        self._initialized = False
 
     def _validate_input(self, x, sr: int):
         """Validate and preprocess input audio data."""
-        if np.ndim(x) == 1:
-            x = np.expand_dims(x, 0)
-        if np.ndim(x) > 2:
-            raise ValueError(f"Too many dimensions for input audio chunk {x.dim()}")
+        if x.ndim == 1:
+            x = x[np.newaxis, :]
+        if x.ndim > 2:
+            raise ValueError(f"Too many dimensions for input audio chunk {x.ndim}")
 
         if sr not in self.sample_rates:
             raise ValueError(
                 f"Supported sampling rates: {self.sample_rates} (or multiple of 16000)"
             )
-        if sr / np.shape(x)[1] > 31.25:
+        if sr / x.shape[1] > 31.25:
             raise ValueError("Input audio chunk is too short")
 
         return x, sr
@@ -86,41 +97,66 @@ class SileroOnnxModel:
         self._context = np.zeros((batch_size, 0), dtype="float32")
         self._last_sr = 0
         self._last_batch_size = 0
+        self._input_buf = None
+        self._initialized = False
 
     def __call__(self, x, sr: int):
         """Process audio input through the VAD model."""
-        x, sr = self._validate_input(x, sr)
         num_samples = 512 if sr == 16000 else 256
-
-        if np.shape(x)[-1] != num_samples:
-            raise ValueError(
-                f"Provided number of samples is {np.shape(x)[-1]} (Supported values: 256 for 8000 sample rate, 512 for 16000)"
-            )
-
-        batch_size = np.shape(x)[0]
         context_size = 64 if sr == 16000 else 32
 
-        if not self._last_batch_size:
-            self.reset_states(batch_size)
-        if (self._last_sr) and (self._last_sr != sr):
-            self.reset_states(batch_size)
-        if (self._last_batch_size) and (self._last_batch_size != batch_size):
-            self.reset_states(batch_size)
+        if not self._initialized:
+            # First call: full validation and buffer setup
+            x, sr = self._validate_input(x, sr)
+            batch_size = x.shape[0]
 
-        if not np.shape(self._context)[1]:
-            self._context = np.zeros((batch_size, context_size), dtype="float32")
+            if not self._last_batch_size:
+                self.reset_states(batch_size)
+            if self._last_sr and self._last_sr != sr:
+                self.reset_states(batch_size)
+            if self._last_batch_size and self._last_batch_size != batch_size:
+                self.reset_states(batch_size)
 
-        x = np.concatenate((self._context, x), axis=1)
+            # Initialize context to correct shape (avoids per-call check)
+            if self._context.shape[1] == 0:
+                self._context = np.zeros((batch_size, context_size), dtype="float32")
 
-        if sr in [8000, 16000]:
-            ort_inputs = {"input": x, "state": self._state, "sr": np.array(sr, dtype="int64")}
-            ort_outs = self.session.run(None, ort_inputs)
+            # Pre-allocate input buffer: (batch, context_size + num_samples)
+            self._input_buf = np.empty(
+                (batch_size, context_size + num_samples), dtype="float32"
+            )
+            self._num_samples = num_samples
+            self._context_size = context_size
+            self._initialized = True
+        else:
+            # Steady-state fast path: skip validation, use cached sizes
+            if x.ndim == 1:
+                x = x[np.newaxis, :]
+
+            # Check for sr/batch changes (rare but must handle)
+            batch_size = x.shape[0]
+            if self._last_sr != sr or self._last_batch_size != batch_size:
+                # Fall back to full re-initialization
+                self._initialized = False
+                return self.__call__(x, sr)
+
+        # Copy context and audio into pre-allocated buffer (no malloc)
+        self._input_buf[:, :context_size] = self._context
+        self._input_buf[:, context_size:] = x
+
+        if sr in (8000, 16000):
+            # Update pre-allocated dict values (no new dict allocation)
+            self._ort_inputs["input"] = self._input_buf
+            self._ort_inputs["state"] = self._state
+            self._ort_inputs["sr"] = self._sr_arrays[sr]
+            ort_outs = self.session.run(None, self._ort_inputs)
             out, state = ort_outs
             self._state = state
         else:
             raise ValueError()
 
-        self._context = x[..., -context_size:]
+        # Update context from the input buffer (must copy — buffer will be overwritten)
+        self._context = self._input_buf[:, -context_size:].copy()
         self._last_sr = sr
         self._last_batch_size = batch_size
 
@@ -206,14 +242,13 @@ class SileroVADAnalyzer(VADAnalyzer):
             Voice confidence score between 0.0 and 1.0.
         """
         try:
-            audio_int16 = np.frombuffer(buffer, np.int16)
-            # Divide by 32768 because we have signed 16-bit data.
-            audio_float32 = np.frombuffer(audio_int16, dtype=np.int16).astype(np.float32) / 32768.0
+            # Convert 16-bit PCM to normalized float32 in [-1.0, 1.0]
+            audio_float32 = np.frombuffer(buffer, np.int16).astype(np.float32) / 32768.0
             new_confidence = self._model(audio_float32, self.sample_rate)[0]
 
             # We need to reset the model from time to time because it doesn't
             # really need all the data and memory will keep growing otherwise.
-            curr_time = time.time()
+            curr_time = time.monotonic()
             diff_time = curr_time - self._last_reset_time
             if diff_time >= _MODEL_RESET_STATES_TIME:
                 self._model.reset_states()

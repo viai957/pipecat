@@ -196,6 +196,33 @@ Run a specific test suite:
 uv run pytest tests/test_name.py
 ```
 
+### Rust native engine (optional)
+
+Pipecat includes an experimental Rust engine (`pipecat-rs/`) that validates processor compatibility and will eventually drive the frame routing hot path for improved performance. The engine activates automatically when the `pipecat-ai-native` package is installed, currently falling back to the Python pipeline loop for execution.
+
+**Build the Rust extension during development:**
+
+```bash
+# Build Rust extension and sync Python deps:
+make dev-native
+
+# Or manually with maturin:
+maturin develop --manifest-path pipecat-rs/crates/pipecat-python/Cargo.toml
+```
+
+**Disable the Rust engine (force pure Python mode):**
+
+```bash
+PIPECAT_NATIVE=0 python your_script.py
+```
+
+**Run the Rust test suite:**
+
+```bash
+make test-native
+# or: cd pipecat-rs && cargo test --all
+```
+
 ## 🤝 Contributing
 
 We welcome contributions from the community! Whether you're fixing bugs, improving documentation, or adding new features, here's how you can help:

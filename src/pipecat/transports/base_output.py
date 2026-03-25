@@ -13,7 +13,6 @@ output processing, including frame buffering, mixing, timing, and media streamin
 import asyncio
 import itertools
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional
 
 from loguru import logger
@@ -47,6 +46,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.base_transport import TransportParams
+from pipecat.utils.thread_pool import SharedThreadPool
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
@@ -395,7 +395,7 @@ class BaseOutputTransport(FrameProcessor):
             self._params = params
 
             # This is to resize images. We only need to resize one image at a time.
-            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._executor = SharedThreadPool.get_executor()
 
             # Buffer to keep track of incoming audio.
             self._audio_buffer = bytearray()
@@ -599,9 +599,13 @@ class BaseOutputTransport(FrameProcessor):
         #
 
         def _create_audio_task(self):
-            """Create the audio processing task."""
+            """Create the audio processing task.
+
+            Audio queue is bounded (maxsize=50) to prevent unbounded growth.
+            At 50fps audio, this is 1 second of buffer — stale audio is useless.
+            """
             if not self._audio_task:
-                self._audio_queue = asyncio.Queue()
+                self._audio_queue = asyncio.Queue(maxsize=50)
                 self._audio_task = self._transport.create_task(self._audio_task_handler())
 
         async def _cancel_audio_task(self):
@@ -804,9 +808,12 @@ class BaseOutputTransport(FrameProcessor):
         #
 
         def _create_video_task(self):
-            """Create the video processing task if video output is enabled."""
+            """Create the video processing task if video output is enabled.
+
+            Video queue is bounded (maxsize=10) — stale video frames are useless.
+            """
             if not self._video_task and self._params.video_out_enabled:
-                self._video_queue = asyncio.Queue()
+                self._video_queue = asyncio.Queue(maxsize=10)
                 self._video_task = self._transport.create_task(self._video_task_handler())
 
         async def _cancel_video_task(self):

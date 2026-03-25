@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pipecat.audio.interruptions.base_interruption_strategy import BaseInterruptionStrategy
 from pipecat.clocks.base_clock import BaseClock
 from pipecat.clocks.system_clock import SystemClock
+from pipecat.frames.frame_types import FrameType
 from pipecat.frames.frames import (
     BotSpeakingFrame,
     CancelFrame,
@@ -44,6 +45,7 @@ from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.pipeline.backpressure import BackpressureConfig, BoundedFrameQueue, QueueConfig
 from pipecat.pipeline.base_pipeline import BasePipeline
 from pipecat.pipeline.base_task import BasePipelineTask, PipelineTaskParams
 from pipecat.pipeline.pipeline import Pipeline, PipelineSink, PipelineSource
@@ -51,6 +53,7 @@ from pipecat.pipeline.task_observer import TaskObserver
 from pipecat.processors.aggregators.llm_response import LLMUserContextAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIObserverParams, RTVIProcessor
+from pipecat.utils.asyncio.process_queue import ProcessQueue
 from pipecat.utils.asyncio.task_manager import BaseTaskManager, TaskManager, TaskManagerParams
 from pipecat.utils.tracing.setup import is_tracing_available
 from pipecat.utils.tracing.tracing_context import TracingContext
@@ -62,6 +65,13 @@ HEARTBEAT_MONITOR_SECS = HEARTBEAT_SECS * 10
 IDLE_TIMEOUT_SECS = 300
 
 CANCEL_TIMEOUT_SECS = 20.0
+
+# frozenset of terminal frame type_ids: CancelFrame, EndFrame, StopFrame.
+# Used in _process_push_queue hot path instead of isinstance() for O(1) int
+# hash lookup (~20 ns) vs isinstance-tuple scan (~100 ns for 3 classes).
+_TERMINAL_TYPE_IDS: frozenset = frozenset(
+    {FrameType.CTRL_CANCEL, FrameType.CTRL_END, FrameType.CTRL_STOP}
+)
 
 
 T = TypeVar("T")
@@ -83,10 +93,18 @@ class IdleFrameObserver(BaseObserver):
             idle_event: The event to set if the idle timeout frames are being pushed.
             idle_timeout_frames: A tuple with the frames that should set the event when received
         """
+        from pipecat.frames.frame_types import FrameType
+
         super().__init__()
         self._idle_event = idle_event
         self._idle_timeout_frames = idle_timeout_frames
         self._processed_frames = set()
+        # Build per-instance subscription: StartFrame + the configured timeout frames.
+        type_ids = {FrameType.CTRL_START}
+        for frame_cls in idle_timeout_frames:
+            if hasattr(frame_cls, "type_id"):
+                type_ids.add(frame_cls.type_id)
+        self.push_frame_types = frozenset(type_ids)
 
     async def on_push_frame(self, data: FramePushed):
         """Callback executed when a frame is pushed in the pipeline.
@@ -152,6 +170,7 @@ class PipelineParams(BaseModel):
     report_only_initial_ttfb: bool = False
     send_initial_empty_metrics: bool = True
     start_metadata: Dict[str, Any] = Field(default_factory=dict)
+    backpressure: Optional[BackpressureConfig] = None
 
 
 class PipelineTask(BasePipelineTask):
@@ -319,12 +338,25 @@ class PipelineTask(BasePipelineTask):
         self._task_manager = task_manager or TaskManager()
 
         # This queue is the queue used to push frames to the pipeline.
-        self._push_queue = asyncio.Queue()
+        # Bounded to prevent unbounded growth under burst load.
+        bp = params.backpressure if params else None
+        push_maxsize = bp.push_queue.max_size if bp else 0  # 0 = unbounded (backward compat)
+        # Use ProcessQueue (deque+Event) when unbounded: asyncio.Queue.put_nowait
+        # costs ~490 ns (internal _unfinished_tasks / _wakeup_next bookkeeping) vs
+        # ~35 ns for deque.append. Fall back to asyncio.Queue only when a size bound
+        # and blocking backpressure are needed.
+        self._push_queue: asyncio.Queue | ProcessQueue = (
+            ProcessQueue() if push_maxsize == 0 else asyncio.Queue(maxsize=push_maxsize)
+        )
+        # Precomputed flag: True when _push_queue is a ProcessQueue (unbounded).
+        # Lets queue_frame call put_nowait() directly, skipping the async put()
+        # coroutine creation overhead (~90 ns per call).
+        self._push_queue_is_unbounded: bool = push_maxsize == 0
         self._process_push_task: Optional[asyncio.Task] = None
 
         # This is the heartbeat queue. When a heartbeat frame is received in the
         # down queue we add it to the heartbeat queue for processing.
-        self._heartbeat_queue = asyncio.Queue()
+        self._heartbeat_queue: asyncio.Queue = asyncio.Queue(maxsize=20)
         self._heartbeat_push_task: Optional[asyncio.Task] = None
         self._heartbeat_monitor_task: Optional[asyncio.Task] = None
 
@@ -395,6 +427,58 @@ class PipelineTask(BasePipelineTask):
         # we only need to pass a single observer (using the StartFrame) which
         # then just acts as a proxy.
         self._observer = TaskObserver(observers=observers, task_manager=self._task_manager)
+
+        # Native engine integration: when the Rust engine is available, create
+        # a NativePipelineTask that exposes queue_frame()/cancel(). This enables
+        # routing frames through Rust's mpsc channels instead of Python's asyncio
+        # queues. The Rust engine owns the frame routing loop while Python manages
+        # lifecycle (setup, observers, events).
+        #
+        # Phase 0: The native task is created and ready, but the Python task
+        # loop still drives execution. queue_frame() can optionally forward to
+        # the native task in Phase 1 when delegation is activated.
+        # Native engine integration: when both the Rust engine and routing are
+        # enabled, frames are routed through Rust's mpsc channels instead of
+        # Python's asyncio queues.
+        #
+        # Gate: PIPECAT_NATIVE_ROUTING=1 activates Rust routing.
+        # PIPECAT_NATIVE=1 (default) just validates the bridge but uses Python routing.
+        self._native_task = None
+        self._use_native_routing = False
+        self._native_run_task: Optional[asyncio.Task] = None
+        self._native_end_reason: Optional[str] = None
+        try:
+            from pipecat._native_status import is_native_engine_enabled
+
+            if is_native_engine_enabled():
+                from pipecat.engine.rust_engine import NativePipelineTask
+
+                native_pipeline = getattr(pipeline, "_native_pipeline", None)
+                if native_pipeline is not None:
+                    # Sink callback: sets the pipeline end event when Rust
+                    # detects a terminal frame at the sink.
+                    def _on_native_sink(reason: str):
+                        self._native_end_reason = reason
+                        self._pipeline_end_event.set()
+
+                    self._native_task = NativePipelineTask(
+                        pipeline=native_pipeline,
+                        params=params,
+                        observers=observers,
+                        sink_callback=_on_native_sink,
+                    )
+
+                    # Activate Rust routing only when explicitly opted in.
+                    self._use_native_routing = (
+                        os.environ.get("PIPECAT_NATIVE_ROUTING", "0") == "1"
+                    )
+                    if self._use_native_routing:
+                        logger.info(f"{self}: Rust native routing ACTIVE")
+                    else:
+                        logger.info(f"{self}: Rust native engine bridge ready (routing=Python)")
+        except Exception as e:
+            logger.debug(f"{self}: Native engine not available: {e}")
+            self._native_task = None
 
         # These events can be used to check which frames make it to the source
         # or sink processors. Instead of calling the event handlers for every
@@ -626,7 +710,12 @@ class PipelineTask(BasePipelineTask):
         Args:
             frame: The frame to be processed.
         """
-        await self._push_queue.put(frame)
+        if self._push_queue_is_unbounded:
+            # Fast path: ProcessQueue is unbounded, put_nowait() never raises.
+            # Avoids creating the async put() coroutine (~90 ns overhead).
+            self._push_queue.put_nowait(frame)
+        else:
+            await self._push_queue.put(frame)
 
     async def queue_frames(self, frames: Iterable[Frame] | AsyncIterable[Frame]):
         """Queues multiple frames to be pushed down the pipeline.
@@ -654,6 +743,14 @@ class PipelineTask(BasePipelineTask):
 
     async def _create_tasks(self):
         """Create and start all pipeline processing tasks."""
+        # When native routing is active, start the Rust pipeline loop as
+        # a background task. It runs concurrently with _process_push_queue
+        # and processes frames that arrive via queue_frame().
+        if self._use_native_routing and self._native_task is not None:
+            self._native_run_task = self._task_manager.create_task(
+                self._native_task.run(), f"{self}::_native_run"
+            )
+
         self._process_push_task = self._task_manager.create_task(
             self._process_push_queue(), f"{self}::_process_push_queue"
         )
@@ -804,7 +901,99 @@ class PipelineTask(BasePipelineTask):
         This is the task that runs the pipeline for the first time by sending
         a StartFrame and by pushing any other frames queued by the user. It runs
         until the tasks is cancelled or stopped (e.g. with an EndFrame).
+
+        When native routing is active (PIPECAT_NATIVE_ROUTING=1), frames are
+        forwarded to the Rust pipeline via queue_frame() instead of going
+        through Python's asyncio queue chain. The Rust pipeline handles frame
+        routing through mpsc channels while Python retains lifecycle management.
         """
+        if self._use_native_routing and self._native_task is not None:
+            await self._process_push_queue_native()
+        else:
+            await self._process_push_queue_python()
+
+    async def _process_push_queue_native(self):
+        """Frame routing via Rust mpsc channels (hybrid delegation).
+
+        The Rust pipeline (started in _create_tasks) sends its own StartFrame
+        and manages the routing loop. This method forwards user-queued frames
+        to Rust and monitors for terminal frames via the sink callback.
+        """
+        self._clock.start()
+        self._maybe_start_idle_task()
+
+        # The Rust pipeline sends StartFrame automatically. We still need
+        # to wait for the Python pipeline's start event since the Python
+        # Source/Sink processors need setup.
+        # For now, send StartFrame through the Python pipeline too for
+        # Source/Sink processor initialization.
+        start_frame = StartFrame(
+            allow_interruptions=self._params.allow_interruptions,
+            audio_in_sample_rate=self._params.audio_in_sample_rate,
+            audio_out_sample_rate=self._params.audio_out_sample_rate,
+            enable_metrics=self._params.enable_metrics,
+            enable_tracing=self._enable_tracing,
+            enable_usage_metrics=self._params.enable_usage_metrics,
+            report_only_initial_ttfb=self._params.report_only_initial_ttfb,
+            interruption_strategies=self._params.interruption_strategies,
+            tracing_context=self._tracing_context,
+        )
+        start_frame.metadata = self._create_start_metadata()
+        await self._pipeline.queue_frame(start_frame)
+        await self._wait_for_pipeline_start(start_frame)
+
+        if self._params.enable_metrics and self._params.send_initial_empty_metrics:
+            await self._pipeline.queue_frame(self._initial_metrics_frame())
+
+        logger.debug(f"{self}: Native routing loop started")
+
+        running = True
+        cleanup_pipeline = True
+        while running:
+            frame = await self._push_queue.get()
+
+            # Forward frame to Rust pipeline via queue_frame()
+            try:
+                self._native_task.queue_frame(frame)
+            except Exception as e:
+                logger.warning(f"{self}: Native queue_frame failed: {e}, falling back to Python")
+                if not self._pipeline._try_fast_enqueue(frame):
+                    await self._pipeline.queue_frame(frame)
+
+            is_terminal = frame.type_id in _TERMINAL_TYPE_IDS
+            self._push_queue.task_done()
+
+            if is_terminal:
+                # Wait for the Rust sink to signal completion via sink_callback
+                # which sets _pipeline_end_event.
+                await self._wait_for_pipeline_end(frame)
+                cleanup_pipeline = frame.type_id != FrameType.CTRL_STOP
+                running = False
+            else:
+                # Batch-drain: forward remaining queued frames to Rust
+                try:
+                    while True:
+                        frame = self._push_queue.get_nowait()
+                        try:
+                            self._native_task.queue_frame(frame)
+                        except Exception:
+                            if not self._pipeline._try_fast_enqueue(frame):
+                                await self._pipeline.queue_frame(frame)
+                        is_terminal = frame.type_id in _TERMINAL_TYPE_IDS
+                        self._push_queue.task_done()
+                        if is_terminal:
+                            await self._wait_for_pipeline_end(frame)
+                            cleanup_pipeline = frame.type_id != FrameType.CTRL_STOP
+                            running = False
+                            break
+                except asyncio.QueueEmpty:
+                    pass
+
+        logger.debug(f"{self}: Native routing loop ended (reason={self._native_end_reason})")
+        await self._cleanup(cleanup_pipeline)
+
+    async def _process_push_queue_python(self):
+        """Frame routing via Python asyncio queues (original path)."""
         self._clock.start()
 
         self._maybe_start_idle_task()
@@ -833,12 +1022,31 @@ class PipelineTask(BasePipelineTask):
         cleanup_pipeline = True
         while running:
             frame = await self._push_queue.get()
-            await self._pipeline.queue_frame(frame)
-            if isinstance(frame, (CancelFrame, EndFrame, StopFrame)):
-                await self._wait_for_pipeline_end(frame)
-            running = not isinstance(frame, (CancelFrame, EndFrame, StopFrame))
-            cleanup_pipeline = not isinstance(frame, StopFrame)
+            if not self._pipeline._try_fast_enqueue(frame):
+                await self._pipeline.queue_frame(frame)
+            is_terminal = frame.type_id in _TERMINAL_TYPE_IDS
             self._push_queue.task_done()
+            if is_terminal:
+                await self._wait_for_pipeline_end(frame)
+                cleanup_pipeline = frame.type_id != FrameType.CTRL_STOP
+                running = False
+            else:
+                # Batch-drain remaining queued frames without per-frame
+                # asyncio.Queue.get() coroutine overhead (~220 ns each).
+                try:
+                    while True:
+                        frame = self._push_queue.get_nowait()
+                        if not self._pipeline._try_fast_enqueue(frame):
+                            await self._pipeline.queue_frame(frame)
+                        is_terminal = frame.type_id in _TERMINAL_TYPE_IDS
+                        self._push_queue.task_done()
+                        if is_terminal:
+                            await self._wait_for_pipeline_end(frame)
+                            cleanup_pipeline = frame.type_id != FrameType.CTRL_STOP
+                            running = False
+                            break
+                except asyncio.QueueEmpty:
+                    pass
         await self._cleanup(cleanup_pipeline)
 
     async def _source_push_frame(self, frame: Frame, direction: FrameDirection):

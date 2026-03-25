@@ -13,7 +13,6 @@ management, parameter configuration, and audio analysis framework.
 
 import asyncio
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Optional
 
@@ -21,6 +20,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.audio.utils import calculate_audio_volume, exp_smoothing
+from pipecat.utils.thread_pool import SharedThreadPool
 
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2
@@ -80,7 +80,7 @@ class VADAnalyzer(ABC):
         self._params = params or VADParams()
         self._num_channels = 1
 
-        self._vad_buffer = b""
+        self._vad_buffer = bytearray()
 
         # Volume exponential smoothing
         self._smoothing_factor = 0.2
@@ -88,7 +88,7 @@ class VADAnalyzer(ABC):
 
         # Thread executor that will run the model. We only need one thread per
         # analyzer because one analyzer just handles one audio stream.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = SharedThreadPool.get_executor()
 
     @property
     def sample_rate(self) -> int:
@@ -189,15 +189,15 @@ class VADAnalyzer(ABC):
 
     def _run_analyzer(self, buffer: bytes) -> VADState:
         """Analyze audio buffer and return current VAD state."""
-        self._vad_buffer += buffer
+        self._vad_buffer.extend(buffer)
 
         num_required_bytes = self._vad_frames_num_bytes
         if len(self._vad_buffer) < num_required_bytes:
             return self._vad_state
 
         while len(self._vad_buffer) >= num_required_bytes:
-            audio_frames = self._vad_buffer[:num_required_bytes]
-            self._vad_buffer = self._vad_buffer[num_required_bytes:]
+            audio_frames = bytes(self._vad_buffer[:num_required_bytes])
+            del self._vad_buffer[:num_required_bytes]
 
             confidence = self.voice_confidence(audio_frames)
 

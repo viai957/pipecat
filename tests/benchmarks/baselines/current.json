@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-03-16T17:45:00.000000+00:00",
+  "git_sha": "7e9546ed",
+  "metrics": {
+    "frame_creation_ns": {
+      "TextFrame": 316,
+      "AudioRawFrame": 203,
+      "SystemFrame": 139
+    },
+    "dispatch_latency_ns": {
+      "isinstance_chain": 57,
+      "type_id_dispatch": 13
+    },
+    "obj_id_ns_per_call": 12,
+    "queue_roundtrip_ns": {
+      "p50": 334,
+      "p95": 375,
+      "p99": 458
+    },
+    "process_frame_ns": {
+      "p50": 220,
+      "p95": 241
+    },
+    "pipeline_throughput_fps": {
+      "1proc": 244000,
+      "2proc": 203000,
+      "4proc": 147000,
+      "8proc": 102000,
+      "16proc": 75000
+    },
+    "memory_per_pipeline_kb": 137.7
+  }
+}
